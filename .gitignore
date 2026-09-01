@@ -1,0 +1,4 @@
+.env
+pomidor.db
+__pycache__/
+*.pyc
