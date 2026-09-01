@@ -19,11 +19,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = "!"
 
 # 3 -> 2 -> 1 -> 0
-# 2 sekundy między liczbami
 COUNTDOWN_SECONDS = 2
 
-# Pierwszy automatyczny rzut bota:
-# od 15 sekund do maksymalnie 3 minut
+# Pierwszy automatyczny rzut Króla:
+# 15 sekund - maksymalnie 3 minuty
 AUTO_THROW_MIN_SECONDS = 15
 AUTO_THROW_MAX_SECONDS = 180
 
@@ -71,6 +70,7 @@ CREATE TABLE IF NOT EXISTS players (
     guild_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     points INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (guild_id, user_id)
 )
 """)
@@ -78,19 +78,41 @@ CREATE TABLE IF NOT EXISTS players (
 db.commit()
 
 
-def add_player(guild_id: int, user_id: int):
+# =========================================================
+# MIGRACJA STAREJ BAZY
+# Jeśli baza już istniała bez kolumny "active",
+# bot doda ją automatycznie.
+# =========================================================
+
+columns = db.execute(
+    "PRAGMA table_info(players)"
+).fetchall()
+
+column_names = [
+    column["name"]
+    for column in columns
+]
+
+if "active" not in column_names:
+
     db.execute(
         """
-        INSERT OR IGNORE INTO players
-        (guild_id, user_id, points)
-        VALUES (?, ?, 0)
-        """,
-        (guild_id, user_id)
+        ALTER TABLE players
+        ADD COLUMN active INTEGER NOT NULL DEFAULT 1
+        """
     )
+
     db.commit()
 
+    print("🍅 Dodano kolumnę ACTIVE do starej bazy.")
+
+
+# =========================================================
+# FUNKCJE BAZY
+# =========================================================
 
 def player_exists(guild_id: int, user_id: int) -> bool:
+
     row = db.execute(
         """
         SELECT 1
@@ -104,22 +126,99 @@ def player_exists(guild_id: int, user_id: int) -> bool:
     return row is not None
 
 
-def remove_player(guild_id: int, user_id: int):
+def player_is_active(guild_id: int, user_id: int) -> bool:
+
+    row = db.execute(
+        """
+        SELECT active
+        FROM players
+        WHERE guild_id = ?
+        AND user_id = ?
+        """,
+        (guild_id, user_id)
+    ).fetchone()
+
+    if row is None:
+        return False
+
+    return row["active"] == 1
+
+
+def add_or_activate_player(
+    guild_id: int,
+    user_id: int
+):
+
+    if player_exists(
+        guild_id,
+        user_id
+    ):
+
+        # Osoba już kiedyś grała.
+        # Przywracamy ją do aktywnej puli,
+        # ale NIE zerujemy punktów.
+        db.execute(
+            """
+            UPDATE players
+            SET active = 1
+            WHERE guild_id = ?
+            AND user_id = ?
+            """,
+            (guild_id, user_id)
+        )
+
+    else:
+
+        # Nowy gracz
+        db.execute(
+            """
+            INSERT INTO players
+            (guild_id, user_id, points, active)
+            VALUES (?, ?, 0, 1)
+            """,
+            (guild_id, user_id)
+        )
+
+    db.commit()
+
+
+def deactivate_player(
+    guild_id: int,
+    user_id: int
+):
+
     db.execute(
         """
-        DELETE FROM players
+        UPDATE players
+        SET active = 0
         WHERE guild_id = ?
         AND user_id = ?
         """,
         (guild_id, user_id)
     )
+
     db.commit()
 
 
-def get_players(guild_id: int):
+def get_active_players(guild_id: int):
+
     return db.execute(
         """
-        SELECT user_id, points
+        SELECT user_id, points, active
+        FROM players
+        WHERE guild_id = ?
+        AND active = 1
+        ORDER BY points DESC, user_id ASC
+        """,
+        (guild_id,)
+    ).fetchall()
+
+
+def get_all_players(guild_id: int):
+
+    return db.execute(
+        """
+        SELECT user_id, points, active
         FROM players
         WHERE guild_id = ?
         ORDER BY points DESC, user_id ASC
@@ -128,7 +227,11 @@ def get_players(guild_id: int):
     ).fetchall()
 
 
-def add_point(guild_id: int, user_id: int):
+def add_point(
+    guild_id: int,
+    user_id: int
+):
+
     db.execute(
         """
         UPDATE players
@@ -138,10 +241,12 @@ def add_point(guild_id: int, user_id: int):
         """,
         (guild_id, user_id)
     )
+
     db.commit()
 
 
 def reset_points(guild_id: int):
+
     db.execute(
         """
         UPDATE players
@@ -150,10 +255,12 @@ def reset_points(guild_id: int):
         """,
         (guild_id,)
     )
+
     db.commit()
 
 
 def reset_everything(guild_id: int):
+
     db.execute(
         """
         DELETE FROM players
@@ -161,6 +268,7 @@ def reset_everything(guild_id: int):
         """,
         (guild_id,)
     )
+
     db.commit()
 
 
@@ -174,29 +282,29 @@ class TomatoGame:
 
         self.active = False
 
-        # Osoba, która uruchomiła zabawę
+        # Osoba uruchamiająca zabawę
         self.host_id = None
 
-        # Osoba posiadająca obecnie pomidora
+        # Osoba posiadająca pomidora
         self.holder_id = None
 
-        # Czy pomidor właśnie leci
+        # Czy pomidor leci
         self.in_flight = False
 
         # Cel rzutu
         self.target_id = None
 
-        # Kto wykonał aktualny rzut
+        # Osoba, która rzuciła
         # None = Król Pomidora / bot
         self.thrower_id = None
 
-        # Event do złapania pomidora
+        # Event łapania
         self.catch_event = None
 
         # Kanał rozgrywki
         self.channel_id = None
 
-        # Automatyczny pierwszy rzut
+        # Zadanie pierwszego automatycznego rzutu
         self.auto_throw_task = None
 
 
@@ -212,7 +320,7 @@ def get_game(guild_id: int) -> TomatoGame:
 
 
 # =========================================================
-# LOSOWE TEKSTY
+# TEKSTY
 # =========================================================
 
 PLAYER_THROW_TEXTS = [
@@ -279,7 +387,7 @@ PLAYER_HIT_TEXTS = [
     "🎯🍅 **CELNY RZUT! {target} był za wolny!**\n"
     "👏 {thrower} otrzymuje **+1 punkt za trafienie!**",
 
-    "💥 **POMIDOROWA KATASTROFA! {target} nie zdążył! 🍅**\n"
+    "💥🍅 **POMIDOROWA KATASTROFA! {target} nie zdążył!**\n"
     "🎯 Punkt trafia do {thrower}! **+1**",
 
     "🍅😈 **Pomidor dosięga {target}!**\n"
@@ -296,7 +404,7 @@ BOT_MISS_TEXTS = [
 
     "😈🍅 **Król Pomidora trafił! {target} nie zdążył zareagować!**",
 
-    "💥🍅 **POMIDOROWA KATASTROFA! {target} nie złapał pierwszego rzutu!**",
+    "💥🍅 **POMIDOROWA KATASTROFA! {target} nie złapał rzutu Króla!**",
 
 ]
 
@@ -331,7 +439,9 @@ NO_TOMATO_TEXTS = [
 # UPRAWNIENIA
 # =========================================================
 
-def is_operator(member: discord.Member) -> bool:
+def is_operator(
+    member: discord.Member
+) -> bool:
 
     if member.guild_permissions.administrator:
         return True
@@ -382,7 +492,9 @@ def mention(user_id):
 # AUTOMATYCZNY RZUT KRÓLA
 # =========================================================
 
-def cancel_auto_throw(game: TomatoGame):
+def cancel_auto_throw(
+    game: TomatoGame
+):
 
     task = game.auto_throw_task
 
@@ -391,14 +503,19 @@ def cancel_auto_throw(game: TomatoGame):
         and task is not asyncio.current_task()
         and not task.done()
     ):
+
         task.cancel()
 
     game.auto_throw_task = None
 
 
-def schedule_auto_throw(guild_id: int):
+def schedule_auto_throw(
+    guild_id: int
+):
 
-    game = get_game(guild_id)
+    game = get_game(
+        guild_id
+    )
 
     if not game.active:
         return
@@ -409,16 +526,24 @@ def schedule_auto_throw(guild_id: int):
     if game.in_flight:
         return
 
-    cancel_auto_throw(game)
+    cancel_auto_throw(
+        game
+    )
 
     game.auto_throw_task = asyncio.create_task(
-        auto_throw_loop(guild_id)
+        auto_throw_loop(
+            guild_id
+        )
     )
 
 
-async def auto_throw_loop(guild_id: int):
+async def auto_throw_loop(
+    guild_id: int
+):
 
-    game = get_game(guild_id)
+    game = get_game(
+        guild_id
+    )
 
     delay = random.randint(
         AUTO_THROW_MIN_SECONDS,
@@ -431,7 +556,9 @@ async def auto_throw_loop(guild_id: int):
 
     try:
 
-        await asyncio.sleep(delay)
+        await asyncio.sleep(
+            delay
+        )
 
     except asyncio.CancelledError:
         return
@@ -445,7 +572,9 @@ async def auto_throw_loop(guild_id: int):
     if game.in_flight:
         return
 
-    guild = bot.get_guild(guild_id)
+    guild = bot.get_guild(
+        guild_id
+    )
 
     if guild is None:
         return
@@ -457,7 +586,9 @@ async def auto_throw_loop(guild_id: int):
     if channel is None:
         return
 
-    rows = get_players(guild_id)
+    rows = get_active_players(
+        guild_id
+    )
 
     possible_targets = []
 
@@ -473,15 +604,15 @@ async def auto_throw_loop(guild_id: int):
         if member.bot:
             continue
 
-        possible_targets.append(member)
+        possible_targets.append(
+            member
+        )
 
     if not possible_targets:
 
         await channel.send(
-            "🍅💤 **Król Pomidora nie ma w kogo rzucić!**"
+            "🍅💤 **Król Pomidora nie ma obecnie żadnej aktywnej ofiary!**"
         )
-
-        schedule_auto_throw(guild_id)
 
         return
 
@@ -505,11 +636,25 @@ async def auto_throw_loop(guild_id: int):
 @bot.event
 async def on_ready():
 
-    print("========================================")
-    print("🍅 KRÓL POMIDORA ZALOGOWANY")
-    print(f"👑 Bot: {bot.user}")
-    print(f"🆔 ID: {bot.user.id}")
-    print("========================================")
+    print(
+        "========================================"
+    )
+
+    print(
+        "🍅 KRÓL POMIDORA ZALOGOWANY"
+    )
+
+    print(
+        f"👑 Bot: {bot.user}"
+    )
+
+    print(
+        f"🆔 ID: {bot.user.id}"
+    )
+
+    print(
+        "========================================"
+    )
 
     await bot.change_presence(
         activity=discord.Game(
@@ -531,27 +676,130 @@ async def dolacz(ctx):
     if not ctx.guild:
         return
 
-    if player_exists(
-        ctx.guild.id,
-        ctx.author.id
+    guild_id = ctx.guild.id
+    user_id = ctx.author.id
+
+    if player_is_active(
+        guild_id,
+        user_id
     ):
 
         await ctx.send(
             f"🍅 {ctx.author.mention}, "
-            f"**już znajdujesz się w puli Króla Pomidora!**"
+            f"**już jesteś w aktywnej puli Króla Pomidora!**"
         )
 
         return
 
-    add_player(
-        ctx.guild.id,
-        ctx.author.id
+    old_player = player_exists(
+        guild_id,
+        user_id
+    )
+
+    add_or_activate_player(
+        guild_id,
+        user_id
+    )
+
+    if old_player:
+
+        await ctx.send(
+            f"🍅👑 {ctx.author.mention} **wraca do zabawy!**\n"
+            "Twój dotychczasowy wynik został zachowany. 😈"
+        )
+
+    else:
+
+        await ctx.send(
+            f"🍅👑 {ctx.author.mention} "
+            f"**dołącza do pomidorowej bitwy!**\n"
+            "Od teraz możesz zostać celem rzutu. 😈"
+        )
+
+
+# =========================================================
+# WYJDŹ
+# =========================================================
+
+@bot.command(
+    name="wyjdz",
+    aliases=["wyjdź"]
+)
+async def wyjdz(ctx):
+
+    if not ctx.guild:
+        return
+
+    guild_id = ctx.guild.id
+    user_id = ctx.author.id
+
+    if not player_exists(
+        guild_id,
+        user_id
+    ):
+
+        await ctx.send(
+            f"🍅 {ctx.author.mention}, "
+            "**nie znajdujesz się jeszcze na liście Króla Pomidora.**"
+        )
+
+        return
+
+    if not player_is_active(
+        guild_id,
+        user_id
+    ):
+
+        await ctx.send(
+            f"🍅 {ctx.author.mention}, "
+            "**już nie znajdujesz się w aktywnej puli.**\n"
+            "Możesz wrócić przez `!dolacz`."
+        )
+
+        return
+
+    game = get_game(
+        guild_id
+    )
+
+    # Nie można wyjść, kiedy posiada się pomidora.
+    if (
+        game.active
+        and game.holder_id == user_id
+    ):
+
+        await ctx.send(
+            "🍅🚫 **Nie możesz teraz wyjść z zabawy — "
+            "aktualnie masz pomidora!**\n"
+            "Najpierw rzuć go w inną osobę."
+        )
+
+        return
+
+    # Nie można wyjść, gdy pomidor właśnie leci w tę osobę.
+    if (
+        game.active
+        and game.in_flight
+        and game.target_id == user_id
+    ):
+
+        await ctx.send(
+            "🍅💨 **Nie uciekniesz tak łatwo! "
+            "Pomidor właśnie leci w Twoją stronę.**\n"
+            "Najpierw dokończ ten rzut."
+        )
+
+        return
+
+    deactivate_player(
+        guild_id,
+        user_id
     )
 
     await ctx.send(
-        f"🍅👑 {ctx.author.mention} "
-        f"**dołącza do pomidorowej bitwy!**\n"
-        f"Od teraz możesz zostać celem rzutu. 😈"
+        f"👋🍅 {ctx.author.mention} **opuszcza aktywną pulę Króla Pomidora.**\n\n"
+        "🏆 Twój zdobyty wynik **zostaje zachowany w rankingu**.\n"
+        "Jeśli zechcesz wrócić, użyj `!dolacz`."
     )
 
 
@@ -587,31 +835,46 @@ async def dodaj(
 
         return
 
-    if player_exists(
+    if player_is_active(
         ctx.guild.id,
         member.id
     ):
 
         await ctx.send(
             f"🍅 {member.mention} "
-            f"**już znajduje się na liście.**"
+            "**już znajduje się w aktywnej puli.**"
         )
 
         return
 
-    add_player(
+    existed = player_exists(
         ctx.guild.id,
         member.id
     )
 
-    await ctx.send(
-        f"✅🍅 **Dodano {member.mention} "
-        f"do puli Króla Pomidora!**"
+    add_or_activate_player(
+        ctx.guild.id,
+        member.id
     )
+
+    if existed:
+
+        await ctx.send(
+            f"✅🍅 **{member.mention} wraca do aktywnej puli!**\n"
+            "Jego dotychczasowe punkty zostały zachowane."
+        )
+
+    else:
+
+        await ctx.send(
+            f"✅🍅 **Dodano {member.mention} "
+            "do puli Króla Pomidora!**"
+        )
 
 
 # =========================================================
-# USUŃ
+# USUŃ Z AKTYWNEJ PULI
+# Punkty również zostają.
 # =========================================================
 
 @bot.command(
@@ -637,56 +900,58 @@ async def usun(
 
         return
 
-    game = get_game(
-        ctx.guild.id
-    )
-
-    if game.active:
-
-        if game.holder_id == member.id:
-
-            await ctx.send(
-                "🍅🚫 **Ta osoba aktualnie posiada pomidora!**"
-            )
-
-            return
-
-        if (
-            game.in_flight
-            and game.target_id == member.id
-        ):
-
-            await ctx.send(
-                "🍅🚫 **Pomidor właśnie leci w tę osobę!**"
-            )
-
-            return
-
-    if not player_exists(
+    if not player_is_active(
         ctx.guild.id,
         member.id
     ):
 
         await ctx.send(
             f"🍅 {member.mention} "
-            f"**nie znajduje się na liście.**"
+            "**nie znajduje się w aktywnej puli.**"
         )
 
         return
 
-    remove_player(
+    game = get_game(
+        ctx.guild.id
+    )
+
+    if (
+        game.active
+        and game.holder_id == member.id
+    ):
+
+        await ctx.send(
+            "🍅🚫 **Ta osoba aktualnie posiada pomidora!**"
+        )
+
+        return
+
+    if (
+        game.active
+        and game.in_flight
+        and game.target_id == member.id
+    ):
+
+        await ctx.send(
+            "🍅🚫 **Pomidor właśnie leci w tę osobę!**"
+        )
+
+        return
+
+    deactivate_player(
         ctx.guild.id,
         member.id
     )
 
     await ctx.send(
-        f"🗑️🍅 **Usunięto {member.mention} "
-        f"z puli graczy.**"
+        f"🗑️🍅 **Usunięto {member.mention} z aktywnej puli.**\n"
+        "🏆 Zdobyte punkty tej osoby zostały zachowane."
     )
 
 
 # =========================================================
-# LISTA
+# LISTA AKTYWNYCH GRACZY
 # =========================================================
 
 @bot.command(
@@ -698,14 +963,14 @@ async def lista(ctx):
     if not ctx.guild:
         return
 
-    players = get_players(
+    players = get_active_players(
         ctx.guild.id
     )
 
     if not players:
 
         await ctx.send(
-            "🍅 **Lista jest pusta.**\n"
+            "🍅 **Aktywna lista jest obecnie pusta.**\n"
             "Użyj `!dolacz`, żeby wejść do zabawy!"
         )
 
@@ -725,13 +990,18 @@ async def lista(ctx):
         )
 
     embed = discord.Embed(
-        title="🍅 Pula Króla Pomidora",
-        description="\n".join(lines),
+        title="🍅 Aktywna pula Króla Pomidora",
+        description="\n".join(
+            lines
+        ),
         color=discord.Color.red()
     )
 
     embed.set_footer(
-        text=f"Liczba graczy: {len(players)}"
+        text=(
+            f"Aktywnych graczy: "
+            f"{len(players)}"
+        )
     )
 
     await ctx.send(
@@ -767,34 +1037,30 @@ async def startpomidor(ctx):
 
         return
 
-    players = get_players(
+    players = get_active_players(
         ctx.guild.id
     )
 
     if not players:
 
         await ctx.send(
-            "🍅 **Nie ma jeszcze żadnych graczy!**"
+            "🍅 **Nie ma obecnie żadnych aktywnych graczy!**\n"
+            "Ktoś musi najpierw użyć `!dolacz`."
         )
 
         return
 
-    cancel_auto_throw(game)
+    cancel_auto_throw(
+        game
+    )
 
     game.active = True
-
     game.host_id = ctx.author.id
-
     game.holder_id = None
-
     game.in_flight = False
-
     game.target_id = None
-
     game.thrower_id = None
-
     game.catch_event = None
-
     game.channel_id = ctx.channel.id
 
     embed = discord.Embed(
@@ -811,12 +1077,15 @@ async def startpomidor(ctx):
 
             "🤲 Złapanie: `!lapie` lub `!łapie`\n\n"
 
-            "✅ Złapanie pomidora = **+1 pkt dla celu**.\n"
-            "🎯 Niezłapanie rzutu gracza = "
-            "**+1 pkt dla rzucającego**.\n\n"
+            "✅ Złapanie = **+1 pkt dla celu**.\n"
+            "🎯 Niezłapanie = **+1 pkt dla gracza rzucającego**.\n\n"
 
-            "🍅 Niezależnie od wyniku pomidor "
-            "**przechodzi do osoby, w którą został rzucony**.\n\n"
+            "🍅 Po rzucie pomidor zawsze przechodzi "
+            "do osoby będącej jego celem.\n\n"
+
+            "👋 Chcesz przestać brać udział? "
+            "Użyj `!wyjdz`.\n"
+            "Twój wynik pozostanie zapisany.\n\n"
 
             "**Nie traćcie czujności. 😈**"
         ),
@@ -910,19 +1179,19 @@ async def rzuc(
 
         return
 
-    if not player_exists(
+    # CEL MUSI BYĆ AKTYWNY
+    if not player_is_active(
         ctx.guild.id,
         target.id
     ):
 
         await ctx.send(
             f"🍅🚫 {target.mention} "
-            f"**nie znajduje się w puli graczy!**"
+            "**nie znajduje się obecnie w aktywnej puli!**"
         )
 
         return
 
-    # Pomidor opuszcza ręce rzucającego
     game.holder_id = None
 
     await perform_throw(
@@ -977,7 +1246,7 @@ async def losuj(ctx):
 
         return
 
-    rows = get_players(
+    rows = get_active_players(
         ctx.guild.id
     )
 
@@ -1007,7 +1276,8 @@ async def losuj(ctx):
     if not possible_targets:
 
         await ctx.send(
-            "🍅 **Nie mam kogo wylosować!**"
+            "🍅 **Nie mam kogo wylosować! "
+            "Potrzebujemy więcej aktywnych graczy.**"
         )
 
         return
@@ -1050,10 +1320,11 @@ async def perform_throw(
     if not game.active:
         return
 
-    cancel_auto_throw(game)
+    cancel_auto_throw(
+        game
+    )
 
     game.in_flight = True
-
     game.target_id = target.id
 
     if thrower is None:
@@ -1199,16 +1470,11 @@ async def perform_throw(
 
 
     game.in_flight = False
-
     game.target_id = None
-
     game.thrower_id = None
-
     game.catch_event = None
 
-
-    # NAJWAŻNIEJSZA ZASADA:
-    # pomidor ZAWSZE przechodzi do celu.
+    # Pomidor ZAWSZE przechodzi do celu.
     game.holder_id = target.id
 
 
@@ -1227,7 +1493,9 @@ async def perform_throw(
             PLAYER_HIT_TEXTS
         ).format(
             target=target.mention,
-            thrower=mention(thrower_id)
+            thrower=mention(
+                thrower_id
+            )
         )
 
         await channel.send(
@@ -1239,7 +1507,7 @@ async def perform_throw(
 
 
     # =====================================================
-    # NIEZŁAPANY RZUT BOTA
+    # NIEZŁAPANY RZUT KRÓLA
     # =====================================================
 
     else:
@@ -1315,12 +1583,10 @@ async def lapie(ctx):
     # =====================================================
 
     game.in_flight = False
-
     game.target_id = None
-
     game.thrower_id = None
 
-    # Cel przejmuje pomidora
+    # Osoba przejmuje pomidora
     game.holder_id = ctx.author.id
 
 
@@ -1350,12 +1616,12 @@ async def lapie(ctx):
         catch_text
         +
         f"\n\n🍅 Pomidor należy teraz do {ctx.author.mention}."
-        f"\nMożesz użyć `!rzuc @osoba` lub `!losuj`."
+        "\nMożesz użyć `!rzuc @osoba` lub `!losuj`."
     )
 
 
 # =========================================================
-# STATUS POMIDORA
+# STATUS
 # =========================================================
 
 @bot.command(name="pomidor")
@@ -1419,6 +1685,8 @@ async def pomidor(ctx):
 
 # =========================================================
 # RANKING
+# Ranking pokazuje WSZYSTKICH,
+# także osoby, które użyły !wyjdz.
 # =========================================================
 
 @bot.command(name="ranking")
@@ -1427,18 +1695,15 @@ async def ranking(ctx):
     if not ctx.guild:
         return
 
-
-    players = get_players(
+    players = get_all_players(
         ctx.guild.id
     )
-
 
     ranked = [
         row
         for row in players
         if row["points"] > 0
     ]
-
 
     if not ranked:
 
@@ -1469,23 +1734,33 @@ async def ranking(ctx):
             "🍅"
         )
 
+        status = (
+            "🟢"
+            if row["active"] == 1
+            else "⚫"
+        )
 
         lines.append(
             f"{medal} **{position}.** "
-            f"<@{row['user_id']}> "
+            f"{status} <@{row['user_id']}> "
             f"— **{row['points']} pkt**"
         )
 
 
     embed = discord.Embed(
         title="👑🍅 Ranking Króla Pomidora",
-        description="\n".join(lines),
+        description="\n".join(
+            lines
+        ),
         color=discord.Color.gold()
     )
 
 
     embed.set_footer(
-        text="Ranking sumuje punkty ze wszystkich dni zabawy."
+        text=(
+            "🟢 aktywny w puli • ⚫ poza aktywną pulą | "
+            "Punkty sumują się przez wszystkie dni."
+        )
     )
 
 
@@ -1504,15 +1779,12 @@ async def stop(ctx):
     if not ctx.guild:
         return
 
-
     if not await operator_required(ctx):
         return
-
 
     game = get_game(
         ctx.guild.id
     )
-
 
     if not game.active:
 
@@ -1524,17 +1796,15 @@ async def stop(ctx):
 
 
     game.active = False
-
     game.in_flight = False
-
     game.target_id = None
-
     game.thrower_id = None
-
     game.holder_id = None
 
 
-    cancel_auto_throw(game)
+    cancel_auto_throw(
+        game
+    )
 
 
     current_event = game.catch_event
@@ -1546,7 +1816,7 @@ async def stop(ctx):
         current_event.set()
 
 
-    players = get_players(
+    players = get_all_players(
         ctx.guild.id
     )
 
@@ -1573,7 +1843,6 @@ async def stop(ctx):
                 f"— 🍅 **{row['points']} pkt**"
             )
 
-
         ranking_text = "\n".join(
             top_lines
         )
@@ -1589,8 +1858,8 @@ async def stop(ctx):
         title="🛑🍅 Dzisiejsza rozgrywka zakończona!",
         description=(
             "Król Pomidora na dziś chowa swoje pomidory. 👑\n\n"
-            "**Punkty oraz lista uczestników zostały zachowane.**\n"
-            "Ranking będzie kontynuowany podczas kolejnego dnia zabawy."
+            "**Wszystkie punkty zostały zachowane.**\n"
+            "Ranking będzie kontynuowany podczas kolejnego dnia."
         ),
         color=discord.Color.red()
     )
@@ -1621,10 +1890,8 @@ async def koniecpomidora(ctx):
     if not ctx.guild:
         return
 
-
     if not await operator_required(ctx):
         return
-
 
     game = get_game(
         ctx.guild.id
@@ -1634,13 +1901,14 @@ async def koniecpomidora(ctx):
     if game.active:
 
         await ctx.send(
-            "🍅🚫 **Najpierw zakończ bieżącą rozgrywkę komendą `!stop`.**"
+            "🍅🚫 **Najpierw zakończ bieżącą rozgrywkę "
+            "komendą `!stop`.**"
         )
 
         return
 
 
-    players = get_players(
+    players = get_all_players(
         ctx.guild.id
     )
 
@@ -1679,14 +1947,12 @@ async def koniecpomidora(ctx):
             f"🏆 Łączny wynik: **{best_score} pkt**"
         )
 
-
     else:
 
         names = ", ".join(
             mention(user_id)
             for user_id in winners
         )
-
 
         winner_text = (
             "👑🍅 **MAMY REMIS NA SZCZYCIE!**\n\n"
@@ -1719,13 +1985,17 @@ async def koniecpomidora(ctx):
 
     embed.add_field(
         name="🏆 Końcowy ranking",
-        value="\n".join(lines),
+        value="\n".join(
+            lines
+        ),
         inline=False
     )
 
 
     embed.set_footer(
-        text="Punkty nie zostały automatycznie wyzerowane."
+        text=(
+            "Wyniki nie zostały automatycznie usunięte."
+        )
     )
 
 
@@ -1744,10 +2014,8 @@ async def resetpunkty_command(ctx):
     if not ctx.guild:
         return
 
-
     if not await operator_required(ctx):
         return
-
 
     game = get_game(
         ctx.guild.id
@@ -1757,7 +2025,8 @@ async def resetpunkty_command(ctx):
     if game.active:
 
         await ctx.send(
-            "🍅🚫 **Najpierw zakończ zabawę komendą `!stop`.**"
+            "🍅🚫 **Najpierw zakończ zabawę "
+            "komendą `!stop`.**"
         )
 
         return
@@ -1770,7 +2039,7 @@ async def resetpunkty_command(ctx):
 
     await ctx.send(
         "🧹🍅 **Ranking został wyzerowany!**\n"
-        "✅ Lista uczestników pozostała bez zmian."
+        "✅ Lista uczestników została zachowana."
     )
 
 
@@ -1784,7 +2053,6 @@ async def resetpomidor_command(ctx):
     if not ctx.guild:
         return
 
-
     if not await operator_required(ctx):
         return
 
@@ -1795,21 +2063,17 @@ async def resetpomidor_command(ctx):
 
 
     game.active = False
-
     game.in_flight = False
-
     game.target_id = None
-
     game.thrower_id = None
-
     game.holder_id = None
-
     game.host_id = None
-
     game.channel_id = None
 
 
-    cancel_auto_throw(game)
+    cancel_auto_throw(
+        game
+    )
 
 
     current_event = game.catch_event
@@ -1828,7 +2092,8 @@ async def resetpomidor_command(ctx):
 
     await ctx.send(
         "💣🍅 **PEŁNY RESET KRÓLA POMIDORA!**\n\n"
-        "✅ Usunięto listę uczestników\n"
+        "✅ Usunięto aktywną pulę\n"
+        "✅ Usunięto nieaktywnych uczestników\n"
         "✅ Usunięto wszystkie punkty\n"
         "✅ Wyczyszczono ranking\n"
         "✅ Zatrzymano aktywną zabawę\n\n"
@@ -1850,30 +2115,31 @@ async def pomocpomidor(ctx):
         title="👑🍅 Król Pomidora — komendy",
         description=(
             "### 🍅 Dla uczestników\n"
-            "`!dolacz` — dołącza do stałej puli\n"
-            "`!lista` — pokazuje uczestników\n"
+            "`!dolacz` — dołącza lub wraca do aktywnej puli\n"
+            "`!wyjdz` / `!wyjdź` — opuszcza pulę, ale zachowuje wynik\n"
+            "`!lista` — pokazuje aktywnych uczestników\n"
             "`!rzuc @osoba` — rzuca pomidorem\n"
             "`!rzuć @osoba` — rzuca pomidorem\n"
-            "`!losuj` — losuje osobę, w którą rzucasz\n"
+            "`!losuj` — losuje aktywny cel\n"
             "`!lapie` / `!łapie` — łapie pomidora\n"
             "`!pomidor` — pokazuje, kto ma pomidora\n"
-            "`!ranking` — wspólny ranking zabawy\n\n"
+            "`!ranking` — wspólny ranking całej zabawy\n\n"
 
             "### 👑 Opiekun Zabaw / Dyrekcja\n"
-            "`!startpomidor` — rozpoczyna rozgrywkę danego dnia\n"
+            "`!startpomidor` — rozpoczyna rozgrywkę\n"
             "`!stop` — kończy rozgrywkę danego dnia\n"
             "`!koniecpomidora` — finał całej edycji\n"
-            "`!dodaj @osoba` — dodaje osobę\n"
-            "`!usun @osoba` — usuwa osobę\n"
-            "`!resetpunkty` — zeruje punkty\n"
-            "`!resetpomidor` — usuwa wszystko\n\n"
+            "`!dodaj @osoba` — dodaje lub przywraca osobę\n"
+            "`!usun @osoba` — usuwa z aktywnej puli, zachowuje wynik\n"
+            "`!resetpunkty` — zeruje wszystkie punkty\n"
+            "`!resetpomidor` — pełne usunięcie wszystkiego\n\n"
 
             "### 🎯 Punktacja\n"
             "**+1 pkt** za złapanie pomidora.\n"
             "**+1 pkt** dla rzucającego, jeśli cel nie złapie.\n\n"
 
             "🍅 Po każdym rzucie pomidor przechodzi "
-            "do osoby, która była jego celem."
+            "do osoby będącej celem."
         ),
         color=discord.Color.red()
     )
