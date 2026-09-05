@@ -232,6 +232,10 @@ class TomatoGame:
 
         self.auto_throw_task = None
 
+        # Licznik ręcznych rzutów w ramach jednej sesji START -> STOP
+        # klucz: (rzucający_id, cel_id), wartość: liczba ręcznych rzutów
+        self.manual_throw_counts = {}
+
 
 games = {}
 
@@ -721,6 +725,7 @@ async def dodaj(
 
 # =========================================================
 # USUŃ Z AKTYWNEJ PULI
+# Punkty zostają. Jeśli osoba ma pomidora, wraca on do Króla.
 # =========================================================
 
 @bot.command(
@@ -735,71 +740,76 @@ async def usun(
     if not ctx.guild:
         return
 
-
     if not await operator_required(ctx):
         return
 
-
     if member is None:
-
         await ctx.send(
             "🍅 Użycie: `!usun @osoba`"
         )
-
         return
-
 
     if not player_is_active(
         ctx.guild.id,
         member.id
     ):
-
         await ctx.send(
             f"🍅 {member.mention} **nie znajduje się w aktywnej puli.**"
         )
-
         return
-
 
     game = get_game(
         ctx.guild.id
     )
 
-
-    if (
-        game.active
-        and game.holder_id == member.id
-    ):
-
-        await ctx.send(
-            "🍅🚫 **Ta osoba aktualnie posiada pomidora.**"
-        )
-
-        return
-
-
+    # Jeśli pomidor właśnie leci w tę osobę, najpierw kończymy ten rzut.
     if (
         game.active
         and game.in_flight
         and game.target_id == member.id
     ):
-
         await ctx.send(
-            "🍅🚫 **Pomidor właśnie leci w tę osobę.**"
+            "🍅🚫 **Pomidor właśnie leci w tę osobę. Poczekaj na zakończenie rzutu.**"
         )
-
         return
 
+    had_tomato = (
+        game.active
+        and game.holder_id == member.id
+    )
 
     deactivate_player(
         ctx.guild.id,
         member.id
     )
 
+    if had_tomato:
+        # Pomidor wraca do Króla i po chwili bot znów rzuci.
+        game.holder_id = None
+        game.thrower_id = None
+        game.target_id = None
+        game.in_flight = False
+
+        current_event = game.catch_event
+        game.catch_event = None
+
+        if current_event is not None:
+            current_event.set()
+
+        schedule_auto_throw(
+            ctx.guild.id
+        )
+
+        await ctx.send(
+            f"🗑️🍅 **Usunięto {member.mention} z aktywnej puli.**\n"
+            "🏆 Zdobyte punkty zostały zachowane.\n"
+            "👑 Pomidor wraca do Króla Pomidora, który za chwilę wybierze nowy cel."
+        )
+        return
 
     await ctx.send(
         f"🗑️🍅 **Usunięto {member.mention} z aktywnej puli.**\n"
-        "Zdobyte punkty zostały zachowane."
+        "🏆 Zdobyte punkty zostały zachowane."
     )
 
 
@@ -918,6 +928,9 @@ async def startpomidor(ctx):
     game.target_id = None
     game.thrower_id = None
     game.catch_event = None
+
+    # Nowa sesja = świeże limity ręcznych rzutów
+    game.manual_throw_counts.clear()
 
     game.channel_id = ctx.channel.id
 
@@ -1047,6 +1060,21 @@ async def rzuc(
 
         return
 
+
+    # Limit dotyczy TYLKO ręcznej komendy !rzuc.
+    # !losuj nie sprawdza i nie zwiększa tego licznika.
+    throw_key = (ctx.author.id, target.id)
+    manual_count = game.manual_throw_counts.get(throw_key, 0)
+
+    if manual_count >= 2:
+        await ctx.send(
+            f"🍅🚫 **W {target.display_name} rzucałeś/aś już 2 razy ręcznie podczas tej rozgrywki.**\n"
+            "Wybierz inną osobę albo użyj `!losuj` — losowanie nie podlega temu limitowi."
+        )
+        return
+
+    # Zapisujemy ręczny rzut dopiero po przejściu wszystkich walidacji.
+    game.manual_throw_counts[throw_key] = manual_count + 1
 
     # WAŻNE:
     # nie zerujemy holder_id.
@@ -1700,6 +1728,7 @@ async def stop(ctx):
     game.target_id = None
     game.thrower_id = None
     game.holder_id = None
+    game.manual_throw_counts.clear()
 
 
     cancel_auto_throw(
@@ -1899,6 +1928,7 @@ async def resetpomidor_command(ctx):
     game.holder_id = None
     game.host_id = None
     game.channel_id = None
+    game.manual_throw_counts.clear()
 
 
     cancel_auto_throw(
@@ -1942,8 +1972,8 @@ async def pomocpomidor(ctx):
             "`!dolacz` — dołącza lub wraca do puli\n"
             "`!wyjdz` / `!wyjdź` — wychodzi, zachowując wynik\n"
             "`!lista` — aktywni uczestnicy\n"
-            "`!rzuc @osoba` — rzuca pomidorem\n"
-            "`!losuj` — losuje cel\n"
+            "`!rzuc @osoba` — rzuca pomidorem (max 2 ręczne rzuty w tę samą osobę na sesję)\n"
+            "`!losuj` — losuje cel i nie podlega limitowi ręcznych rzutów\n"
             "`!lapie` / `!łapie` — łapie pomidora\n"
             "`!pomidor` — pokazuje właściciela pomidora\n"
             "`!ranking` — ranking całej edycji\n\n"
